@@ -102,7 +102,6 @@ QLineEdit, QTextEdit {
 QLineEdit:focus, QTextEdit:focus {
     border: 1px solid rgba(137,180,250,0.9);
     outline: none;
-    box-shadow: 0 4px 18px rgba(137,180,250,0.06);
 }
 
 /* Placeholder style (less bold, more subtle) */
@@ -123,10 +122,11 @@ QPushButton {
     border: none;
 }
 QPushButton:hover {
-    transform: translateY(-1px);
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                               stop:0 rgba(147,190,250,0.95),
+                               stop:1 rgba(106,175,250,0.95));
 }
 QPushButton:pressed {
-    transform: translateY(0px);
     background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
                                stop:0 rgba(96,165,250,0.95),
                                stop:1 rgba(137,180,250,0.95));
@@ -306,6 +306,9 @@ class APIClient:
 
     def get_messages(self, username):
         return self._request('GET', '/get_messages', params={'username': username})
+    
+    def get_contacts(self):
+        return self._request('GET', '/get_contacts')
 
 # --- CryptoHelper: Handles all encryption/decryption (Unchanged) ---
 class CryptoHelper:
@@ -728,6 +731,7 @@ class MainChatWidget(QWidget):
 
         self.contacts_list = QListWidget()
         left_layout.addWidget(self.contacts_list)
+        self._load_contacts()
 
         # --- Right Pane ---
         right_pane = QWidget()
@@ -838,6 +842,16 @@ class MainChatWidget(QWidget):
     def _on_contact_selected(self, item):
         username = item.text()
         self._select_chat_partner(username)
+
+    def _load_contacts(self):
+        """Fetches and populates the contact list from the server."""
+        response = self.api.get_contacts()
+        if response and 'contacts' in response:
+            self.contacts_list.clear()
+            for username in response['contacts']:
+                self._add_to_list(self.contacts_list, username)
+        else:
+            print("Could not load contacts.")
 
     def _select_chat_partner(self, username):
         """Switches the main chat view to a new partner."""

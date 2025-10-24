@@ -255,6 +255,44 @@ def accept_chat(current_user):
         
     return jsonify({'message': f'Chat request from {requester_username} accepted!'}), 200
 
+
+@app.route('/get_contacts', methods=['GET'])
+@token_required
+def get_contacts(current_user):
+    """
+    Get all users with whom the current user has an 'accepted' chat.
+    This includes chats they requested and chats they accepted.
+    """
+    db = get_db()
+    my_id = current_user['id']
+    
+    # Find users I requested and were accepted
+    i_requested = db.execute(
+        """
+        SELECT u.username
+        FROM chat_requests cr
+        JOIN users u ON u.id = cr.requested_id
+        WHERE cr.requester_id = ? AND cr.status = 'accepted'
+        """, (my_id,)
+    ).fetchall()
+    
+    # Find users who requested me and I accepted
+    they_requested = db.execute(
+        """
+        SELECT u.username
+        FROM chat_requests cr
+        JOIN users u ON u.id = cr.requester_id
+        WHERE cr.requested_id = ? AND cr.status = 'accepted'
+        """, (my_id,)
+    ).fetchall()
+
+    # Combine the lists and remove duplicates
+    contacts = set(row['username'] for row in i_requested)
+    contacts.update(row['username'] for row in they_requested)
+    
+    return jsonify({'contacts': list(contacts)})
+
+
 @app.route('/send_message', methods=['POST'])
 @token_required
 def send_message(current_user):
