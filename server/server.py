@@ -117,7 +117,7 @@ def login():
     token = jwt.encode({
         'user_id': user['id'],
         'username': user['username'],
-        'exp': datetime.datetime.utcnow() + datetime.timedelta(hours=24)
+        'exp': datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=24)
     }, app.config['SECRET_KEY'], algorithm="HS256")
 
     return jsonify({'token': token})
@@ -298,15 +298,16 @@ def get_contacts(current_user):
 def send_message(current_user):
     """
     Send an encrypted message to a user.
-    The server just stores the blob.
-    JSON: { "recipient_username": "...", "encrypted_blob": "..." }
+    The server stores a blob for the sender and one for the recipient.
+    JSON: { "recipient_username": "...", "sender_blob": "...", "recipient_blob": "..." }
     """
     data = request.get_json()
     recipient_username = data.get('recipient_username')
-    encrypted_blob = data.get('encrypted_blob')
+    sender_blob = data.get('sender_blob')
+    recipient_blob = data.get('recipient_blob')
     
-    if not recipient_username or not encrypted_blob:
-        return jsonify({'message': 'Missing recipient_username or encrypted_blob'}), 400
+    if not recipient_username or not sender_blob or not recipient_blob:
+        return jsonify({'message': 'Missing recipient_username, sender_blob, or recipient_blob'}), 400
 
     db = get_db()
     recipient = db.execute('SELECT id FROM users WHERE username = ?', (recipient_username,)).fetchone()
@@ -317,8 +318,8 @@ def send_message(current_user):
     # For simplicity, we'll allow any user to message any other user for now.
     
     db.execute(
-        'INSERT INTO messages (sender_id, recipient_id, encrypted_blob, timestamp) VALUES (?, ?, ?, ?)',
-        (current_user['id'], recipient['id'], encrypted_blob, datetime.datetime.utcnow())
+        'INSERT INTO messages (sender_id, recipient_id, sender_blob, recipient_blob, timestamp) VALUES (?, ?, ?, ?, ?)',
+        (current_user['id'], recipient['id'], sender_blob, recipient_blob, datetime.datetime.now(datetime.timezone.utc))
     )
     db.commit()
     return jsonify({'message': 'Message sent successfully.'}), 201
@@ -329,8 +330,12 @@ def get_messages(current_user):
     """
     Get all messages between the logged-in user and another user.
     Query: /get_messages?username=bob
+    Query (optional): /get_messages?username=bob&since_id=10
     """
     partner_username = request.args.get('username')
+    # Get since_id, default to 0 if not provided
+    since_id = request.args.get('since_id', 0, type=int) 
+    
     if not partner_username:
         return jsonify({'message': 'Missing username query parameter.'}), 400
 
@@ -342,15 +347,29 @@ def get_messages(current_user):
     my_id = current_user['id']
     partner_id = partner['id']
 
+    # --- UPDATED QUERY ---
+    # We add the "AND m.id > ?" to the WHERE clause
     messages_rows = db.execute(
         """
-        SELECT m.*, u_sender.username AS sender_username
+        SELECT 
+            m.id, 
+            m.sender_id, 
+            m.recipient_id, 
+            m.timestamp, 
+            u_sender.username AS sender_username,
+            CASE
+                WHEN m.sender_id = ? THEN m.sender_blob
+                ELSE m.recipient_blob
+            END AS encrypted_blob
         FROM messages m
         JOIN users u_sender ON u_sender.id = m.sender_id
-        WHERE (m.sender_id = ? AND m.recipient_id = ?) OR (m.sender_id = ? AND m.recipient_id = ?)
+        WHERE 
+            ((m.sender_id = ? AND m.recipient_id = ?) OR (m.sender_id = ? AND m.recipient_id = ?))
+            AND m.id > ?
         ORDER BY m.timestamp ASC
         """,
-        (my_id, partner_id, partner_id, my_id)
+        # Parameters match the '?' marks in order
+        (my_id, my_id, partner_id, partner_id, my_id, since_id)
     ).fetchall()
 
     messages = [dict(row) for row in messages_rows]

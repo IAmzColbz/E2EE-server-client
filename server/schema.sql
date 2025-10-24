@@ -28,7 +28,8 @@ CREATE TABLE IF NOT EXISTS messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     sender_id INTEGER NOT NULL,
     recipient_id INTEGER NOT NULL,
-    encrypted_blob TEXT NOT NULL,
+    sender_blob TEXT NOT NULL,
+    recipient_blob TEXT NOT NULL,
     timestamp DATETIME NOT NULL,
     FOREIGN KEY (sender_id) REFERENCES users (id),
     FOREIGN KEY (recipient_id) REFERENCES users (id)

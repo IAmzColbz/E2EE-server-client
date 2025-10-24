@@ -26,7 +26,7 @@ from PySide6.QtWidgets import (
     QTextEdit, QSplitter, QDialog, QMessageBox, QInputDialog, QFrame
 )
 from PySide6.QtCore import (
-    Qt, QObject, Signal, Slot, QThread, QSize
+    Qt, QObject, Signal, Slot, QThread, QSize, QTimer
 )
 from PySide6.QtGui import QIcon, QFont
 
@@ -301,11 +301,15 @@ class APIClient:
     def accept_chat(self, requester_username):
         return self._request('POST', '/accept_chat', {'requester_username': requester_username})
 
-    def send_message(self, recipient_username, encrypted_blob):
-        return self._request('POST', '/send_message', {'recipient_username': recipient_username, 'encrypted_blob': encrypted_blob})
+    def send_message(self, recipient_username, sender_blob, recipient_blob):
+        return self._request('POST', '/send_message', {
+            'recipient_username': recipient_username, 
+            'sender_blob': sender_blob,
+            'recipient_blob': recipient_blob
+        })
 
-    def get_messages(self, username):
-        return self._request('GET', '/get_messages', params={'username': username})
+    def get_messages(self, username, since_id=0):
+        return self._request('GET', '/get_messages', params={'username': username, 'since_id': since_id})
     
     def get_contacts(self):
         return self._request('GET', '/get_contacts')
@@ -405,10 +409,12 @@ class CryptoHelper:
             return f"[Error: Decryption failed. ({type(e).__name__})]"
 
 
-# --- Qt Polling Worker (Thread-safe) ---
+# --- Qt Polling Worker (Thread-safe AND Non-Blocking) ---
 class PollingWorker(QObject):
     """
     Runs in a separate thread to poll the server without freezing the UI.
+    Uses a QTimer instead of a blocking loop to keep the event loop free
+    to process signals.
     """
     messages_received = Signal(dict)
     requests_received = Signal(dict)
@@ -418,47 +424,74 @@ class PollingWorker(QObject):
         super().__init__()
         self.api = api
         self._current_partner = None
-        self._is_running = True
+        self._last_message_id = 0
+        
+        # Set up a timer to drive the polling
+        self.poll_timer = QTimer(self)
+        self.poll_timer.setInterval(3000) # Poll every 3 seconds
+        self.poll_timer.timeout.connect(self._on_poll)
 
     @Slot(str)
     def set_chat_partner(self, partner_username):
         """Slot to update the partner from the main thread."""
+        print(f"[POLLER] Setting partner to: {partner_username}") # Good for debugging
         self._current_partner = partner_username
+        self._last_message_id = 0
+
+    @Slot(int)
+    def set_last_message_id(self, message_id):
+        """Slot to update the last known ID from the main thread."""
+        if message_id > self._last_message_id:
+            # print(f"[POLLER] Updating last_id to: {message_id}") # Good for debugging
+            self._last_message_id = message_id
 
     @Slot()
     def stop(self):
         """Slot to stop the polling loop."""
-        self._is_running = False
+        print("[POLLER] Stopping timer.")
+        self.poll_timer.stop()
 
     @Slot()
     def run(self):
-        """The main polling loop."""
-        while self._is_running:
-            partner = self._current_partner # Thread-safe copy
-            
-            # 1. Poll for messages for the active partner
-            if partner:
-                messages_data = self.api.get_messages(partner)
-                if messages_data is not None:
-                    # Only emit if the partner hasn't changed
-                    if partner == self._current_partner:
-                        self.messages_received.emit(messages_data)
-                else:
-                    self.connection_error.emit(f"Could not fetch messages for {partner}.")
-            
-            # 2. Poll for new chat requests
-            requests_data = self.api.get_chat_requests()
-            if requests_data is not None:
-                self.requests_received.emit(requests_data)
-            else:
-                self.connection_error.emit("Could not fetch chat requests.")
+        """
+        Called by the QThread.started signal.
+        This just starts the timer, which now drives the polling.
+        """
+        print("[POLLER] Starting timer.")
+        self.poll_timer.start()
+        # We also do an initial poll immediately
+        self._on_poll()
 
-            # Interruptible sleep
-            for _ in range(30): # 30 * 100ms = 3 seconds
-                if not self._is_running:
-                    break
-                QThread.msleep(100)
-        print("Polling thread stopped.")
+    @Slot()
+    def _on_poll(self):
+        """
+        This is the actual polling logic, executed every 3 seconds.
+        """
+        # 1. Poll for messages for the active partner
+        # No need to copy self._current_partner, we're on the same thread
+        if self._current_partner:
+            messages_data = self.api.get_messages(self._current_partner, since_id=self._last_message_id)
+            
+            if messages_data is not None:
+                messages_list = messages_data.get('messages')
+                if messages_list: # Check if list is not None AND not empty
+                    # Find new last ID *before* emitting
+                    new_last_id = max(msg['id'] for msg in messages_list)
+                    if new_last_id > self._last_message_id:
+                        self._last_message_id = new_last_id
+                
+                # Emit even if empty, so the UI can process
+                self.messages_received.emit(messages_data)
+            else:
+                self.connection_error.emit(f"Could not fetch messages for {self._current_partner}.")
+        
+        # 2. Poll for new chat requests
+        requests_data = self.api.get_chat_requests()
+        if requests_data is not None:
+            self.requests_received.emit(requests_data)
+        else:
+            self.connection_error.emit("Could not fetch chat requests.")
+
 
 # --- Qt Login/Register Widget ---
 class LoginWidget(QWidget):
@@ -687,6 +720,7 @@ class MainChatWidget(QWidget):
     """
     # Signal to tell the worker to change partners
     partner_changed = Signal(str)
+    last_id_updated = Signal(int)
 
     def __init__(self, api, crypto, username):
         super().__init__()
@@ -797,6 +831,8 @@ class MainChatWidget(QWidget):
         # Connect our partner_changed signal to the worker's slot
         self.partner_changed.connect(self.polling_worker.set_chat_partner)
         
+        self.last_id_updated.connect(self.polling_worker.set_last_message_id)
+        
         self.polling_thread.start()
         print("Polling thread started.")
 
@@ -875,7 +911,7 @@ class MainChatWidget(QWidget):
 
     def _load_chat_history(self, username):
         """Fetches and displays the full chat history."""
-        # Ensure we have the partner's public key
+        # --- (public key logic is unchanged) ---
         if username not in self.key_cache:
             key_data = self.api.get_key(username)
             if not key_data or 'public_key' not in key_data:
@@ -884,27 +920,43 @@ class MainChatWidget(QWidget):
                 self.chat_partner_label.setText("Select a contact to chat")
                 self.message_entry.setEnabled(False)
                 self.send_button.setEnabled(False)
+                self.last_id_updated.emit(0) # <-- ADD THIS
                 return
             try:
                 self.key_cache[username] = self.crypto.load_public_key_pem(key_data['public_key'])
             except Exception as e:
                 self._add_message_to_display(f"Error: Could not parse public key for {username}. {e}", 'system')
+                self.last_id_updated.emit(0) # <-- ADD THIS
                 return
+        # -----------------------------------------
 
         # Fetch messages
-        history = self.api.get_messages(username)
+        history = self.api.get_messages(username, since_id=0) 
         
         self.chat_display.clear()
         
         if history and 'messages' in history:
             self.chat_cache[username] = set() # Reset cache
+            
+            if not history['messages']:
+                self._add_message_to_display(f"No messages yet. Say hello!", 'system')
+                self.last_id_updated.emit(0) # <-- ADD THIS LINE
+                return
+
             for msg in history['messages']:
                 self._process_message(msg, is_history=True)
+            
+            # Find the max ID from history and tell the polling worker
+            last_id = max(msg['id'] for msg in history['messages'])
+            self.last_id_updated.emit(last_id)
+            
             self._add_message_to_display(f"--- End of history ---", 'system')
         elif history is not None:
             self._add_message_to_display(f"No messages yet. Say hello!", 'system')
+            self.last_id_updated.emit(0) # <-- ADD THIS LINE
         else:
-            self._add_message_to_display(f"Could not load messages.", 'system')
+            self.add_message_to_display(f"Could not load messages.", 'system')
+            self.last_id_updated.emit(0) # <-- ADD THIS LINE
             
     @Slot()
     def _on_send_message(self):
@@ -918,6 +970,14 @@ class MainChatWidget(QWidget):
             return
 
         try:
+            # --- Get own public key ---
+            # Get it directly from our loaded private key.
+            if not self.crypto.private_key:
+                 self._show_error("Error", "Your own private key is not loaded. Cannot encrypt for self.")
+                 return
+            my_public_key = self.crypto.private_key.public_key()
+            # -------------------------
+
             text_bytes = text.encode('utf-8')
             if len(text_bytes) > RSA_MAX_MESSAGE_BYTES:
                 self._show_error("Message Too Long", 
@@ -925,9 +985,11 @@ class MainChatWidget(QWidget):
                     f"The limit for this RSA chat is {RSA_MAX_MESSAGE_BYTES} bytes.")
                 return
 
-            encrypted_blob = self.crypto.encrypt(text_bytes, partner_key)
+            # Encrypt for both parties
+            recipient_blob = self.crypto.encrypt(text_bytes, partner_key)
+            sender_blob = self.crypto.encrypt(text_bytes, my_public_key)
             
-            if self.api.send_message(self.current_partner, encrypted_blob) is not None:
+            if self.api.send_message(self.current_partner, sender_blob, recipient_blob) is not None:
                 # Add to UI immediately
                 self._add_message_to_display(f"{self.username} (You): {text}", 'self')
                 self.message_entry.clear()
