@@ -6,6 +6,7 @@ import os
 import json
 import threading
 import time
+import html
 import base64
 from queue import Queue
 
@@ -1054,17 +1055,41 @@ class MainChatWidget(QWidget):
 
     def _add_message_to_display(self, message, tag):
         """Adds a styled message to the QTextEdit using HTML."""
+        
+        # --- SECURE ESCAPING ---
+        # Prevents HTML injection from usernames or message content.
+        escaped_message = html.escape(message)
+        # -----------------------
+
         if tag == 'self':
-            # Blue
-            html = f"<p style='color: #89b4fa; text-align: right; margin: 2px 0;'>{message}</p>"
+            # A div aligned right, containing a 'self' bubble
+            # We use margin-bottom: 6px for padding between messages
+            html_str = (
+                f"<div style='text-align: right; margin-bottom: 6px;'>"
+                # This inner div is the bubble, using inline-block
+                f"<div style='display: inline-block; text-align: left; "
+                f"color: #e6eef8; background-color: rgba(137,180,250,0.12); "
+                f"padding: 8px 12px; border-radius: 12px; "
+                f"max-width: 75%;'>{escaped_message}</div>"
+                f"</div>"
+            )
         elif tag == 'other':
-            # Default text
-            html = f"<p style='color: #cdd6f4; text-align: left; margin: 2px 0;'>{message}</p>"
+            # A div aligned left, containing an 'other' bubble
+            html_str = (
+                f"<div style='text-align: left; margin-bottom: 6px;'>"
+                # This inner div is the bubble, using inline-block
+                f"<div style='display: inline-block; text-align: left; "
+                f"color: #e6eef8; background-color: rgba(255,255,255,0.02); "
+                f"padding: 8px 12px; border-radius: 12px; "
+                f"max-width: 75%;'>{escaped_message}</div>"
+                f"</div>"
+            )
         else: # 'system'
-            # Gray, italic
-            html = f"<p style='color: #7f849c; text-align: center; margin: 2px 0;'><i>{message}</i></p>"
+            # The <p> tag is fine here since it's centered by your QSS
+            escaped_message = html.escape(message) 
+            html_str = f"<p class='system'><i>{escaped_message}</i></p>"
             
-        self.chat_display.append(html)
+        self.chat_display.append(html_str)
         self.chat_display.verticalScrollBar().setValue(
             self.chat_display.verticalScrollBar().maximum()
         )
